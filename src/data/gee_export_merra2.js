@@ -23,7 +23,7 @@ var cities = {
 // EDIT this band list once the Section 7 formula question is resolved:
 //   thesis-as-written: ['BCSMASS', 'OCSMASS', 'SO4CMASS', 'DUSMASS25', 'SSSMASS25']
 //   NASA GMAO formula: ['BCSMASS', 'OCSMASS', 'SO4SMASS', 'DUSMASS25', 'SSSMASS25']
-var BANDS = ['BCSMASS', 'OCSMASS', 'SO4CMASS', 'DUSMASS25', 'SSSMASS25'];
+var BANDS = ['BCSMASS', 'OCSMASS', 'SO4CMASS', 'SO4SMASS', 'DUSMASS25', 'SSSMASS25'];
 
 var collection = ee.ImageCollection('NASA/GSFC/MERRA/aer/2')
   .filterDate('2022-08-01', '2025-01-01')

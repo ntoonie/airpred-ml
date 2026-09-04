@@ -41,7 +41,7 @@ HOURLY_VARS = [
 ]
 
 DATE_START = "2022-08-01"
-DATE_END = "2024-12-31"
+DATE_END = "2024-12-30"
 
 
 def fetch_era5_for_city(city: str, lat: float, lon: float) -> pd.DataFrame:

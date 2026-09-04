@@ -19,6 +19,7 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from sklearn.preprocessing import StandardScaler
 
 KG_M3_TO_UG_M3 = 1e9  # valid only if inputs are genuinely kg/m3
@@ -53,6 +54,82 @@ def derive_pm25_nasa_gmao_formula(df: pd.DataFrame) -> pd.Series:
     PM2.5 = DUSMASS25 + OCSMASS + BCSMASS + SSSMASS25 + SO4SMASS*1.375"""
     c = df[["BCSMASS", "OCSMASS", "SO4SMASS", "DUSMASS25", "SSSMASS25"]] * KG_M3_TO_UG_M3
     return c["DUSMASS25"] + c["OCSMASS"] + c["BCSMASS"] + c["SSSMASS25"] + c["SO4SMASS"] * 1.375
+
+
+# ---------------------------------------------------------------------------
+# 1b. Ground-truth bias validation (thesis Section "Ground Truth Validation
+# Dataset" / Data Generation Steps 4.1-4.2) -- shared by BOTH the OpenAQ
+# Manila hourly comparison and any EMB-DENR annual comparison. Purely
+# descriptive: characterizes bias, does not feed back into training.
+# ---------------------------------------------------------------------------
+def compute_bias_metrics(model_values: pd.Series, obs_values: pd.Series) -> dict:
+    """model_values, obs_values: aligned (same index/order) PM2.5 series --
+    one from your derived MERRA-2 data, one from an independent ground-truth
+    source (OpenAQ sensor readings, or EMB-DENR reported averages).
+    Returns Pearson r, Mean Bias Error (model - obs), and RMSE."""
+    r, _ = stats.pearsonr(model_values, obs_values)
+    mbe = float((model_values - obs_values).mean())
+    rmse = float(np.sqrt(((model_values - obs_values) ** 2).mean()))
+    return {"n": len(model_values), "pearson_r": float(r), "mbe": mbe, "rmse": rmse}
+
+
+# ---------------------------------------------------------------------------
+# 1c. BLH gap-filling from an alternate source (MERRA-2 PBLH), for the ~6-month
+# boundary_layer_height gap found in ERA5 (Jan-Jun 2024, 4368 hours/city).
+# Two-step process: (1) quantify systematic bias between ERA5's BLH and
+# MERRA-2's PBLH during a period where BOTH exist, (2) only then decide
+# whether/how to correct MERRA-2's values before filling ERA5's gap with them.
+# Never fill blindly -- MERRA-2's PBLH uses a different definition (eddy
+# diffusion coefficient method) and is documented in the literature to run
+# systematically shallower than other boundary-layer-height products.
+# ---------------------------------------------------------------------------
+def compare_blh_sources(era5_blh: pd.DataFrame, merra2_pblh: pd.DataFrame) -> dict:
+    """era5_blh: columns [city, datetime, boundary_layer_height], non-null rows only.
+    merra2_pblh: columns [city, datetime, PBLH].
+    Returns bias stats over whatever overlap exists between the two (should be
+    all months OUTSIDE the known gap, since that's where ERA5 has real values
+    to compare against)."""
+    merged = era5_blh.merge(merra2_pblh, on=["city", "datetime"], how="inner")
+    if len(merged) == 0:
+        raise ValueError("No overlapping (city, datetime) rows between ERA5 and MERRA-2 PBLH -- check merge keys.")
+    diff = merged["PBLH"] - merged["boundary_layer_height"]
+    return {
+        "n_overlap_hours": len(merged),
+        "era5_mean": float(merged["boundary_layer_height"].mean()),
+        "merra2_mean": float(merged["PBLH"].mean()),
+        "mean_diff_merra2_minus_era5": float(diff.mean()),
+        "std_diff": float(diff.std()),
+        "ratio_merra2_over_era5": float(merged["PBLH"].mean() / merged["boundary_layer_height"].mean()),
+    }
+
+
+def fill_blh_gap(
+    era5_df: pd.DataFrame,
+    merra2_pblh: pd.DataFrame,
+    bias_correction: float = 0.0,
+) -> pd.DataFrame:
+    """Fills NaN boundary_layer_height rows in era5_df using MERRA-2 PBLH,
+    optionally shifted by `bias_correction` (e.g. the mean_diff from
+    compare_blh_sources, applied with the right sign to bring MERRA-2 values
+    onto ERA5's scale: corrected = PBLH - mean_diff_merra2_minus_era5).
+    Adds a `blh_source` column ('era5' or 'merra2_gapfill') so every value's
+    provenance stays traceable -- required before this is defensible in a
+    methodology write-up, per the "flag, don't silently fix" principle."""
+    df = era5_df.copy()
+    df["blh_source"] = np.where(df["boundary_layer_height"].isna(), "merra2_gapfill", "era5")
+
+    pblh_lookup = merra2_pblh.set_index(["city", "datetime"])["PBLH"]
+    missing_mask = df["boundary_layer_height"].isna()
+    keys = list(zip(df.loc[missing_mask, "city"], df.loc[missing_mask, "datetime"]))
+    fill_values = pblh_lookup.reindex(keys).to_numpy() - bias_correction
+
+    n_unfillable = np.isnan(fill_values).sum()
+    if n_unfillable > 0:
+        print(f"WARNING: {n_unfillable} gap rows have no matching MERRA-2 PBLH value "
+              f"(city/datetime not found) -- these remain NaN.")
+
+    df.loc[missing_mask, "boundary_layer_height"] = fill_values
+    return df
 
 
 # ---------------------------------------------------------------------------
