@@ -1,18 +1,3 @@
-"""End-to-end preprocessing pipeline.
-
-Order of operations (matches thesis Data Generation Procedure steps 1-8):
-  1. PM2.5 derivation + unit conversion       (derive_pm25_*)
-  2. Dataset merging                          (merge_datasets)
-  3. Data validation                          (validate_merged)
-  4. Missing value handling                   (interpolate_gaps)
-  5. Chronological split                      (chronological_split)
-  6. Normalization (fit on TRAIN only)        (fit_transform_split)
-  7. Sliding window generation                (make_windows_for_city / build_dataset)
-
-*** Resolve implementation guide Section 7 (PM2.5 formula) before trusting
-    the output of this pipeline. Both candidate formulas are implemented
-    below so you can run either once you've decided. ***
-"""
 from __future__ import annotations
 
 from typing import Sequence
@@ -22,7 +7,7 @@ import pandas as pd
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
 
-KG_M3_TO_UG_M3 = 1e9  # valid only if inputs are genuinely kg/m3
+KG_M3_TO_UG_M3 = 1e9  # kg/m3 only
 
 FEATURE_COLS = [
     "pm25",
@@ -34,39 +19,29 @@ FEATURE_COLS = [
     "surface_pressure",
     "boundary_layer_height",
 ]
-MET_COLS = FEATURE_COLS[1:]  # the 7 meteorological columns, PM2.5 excluded
+MET_COLS = FEATURE_COLS[1:]  # met only
 
 
 # ---------------------------------------------------------------------------
 # 1. PM2.5 derivation
 # ---------------------------------------------------------------------------
 def derive_pm25_thesis_formula(df: pd.DataFrame) -> pd.Series:
-    """As literally written in the thesis:
-    PM2.5 = BCSMASS + 1.8*OCSMASS + SO4CMASS + DUSMASS25 + SSSMASS25
-    Verify SO4CMASS is really the intended band, and that the raw values
-    are kg/m3 (not kg/m2), before trusting this output -- see Section 7."""
+    # thesis formula, SO4CMASS
     c = df[["BCSMASS", "OCSMASS", "SO4CMASS", "DUSMASS25", "SSSMASS25"]] * KG_M3_TO_UG_M3
     return c["BCSMASS"] + 1.8 * c["OCSMASS"] + c["SO4CMASS"] + c["DUSMASS25"] + c["SSSMASS25"]
 
 
 def derive_pm25_nasa_gmao_formula(df: pd.DataFrame) -> pd.Series:
-    """NASA GMAO published formula (requires SO4SMASS, not SO4CMASS):
-    PM2.5 = DUSMASS25 + OCSMASS + BCSMASS + SSSMASS25 + SO4SMASS*1.375"""
+    # NASA formula, SO4SMASS
     c = df[["BCSMASS", "OCSMASS", "SO4SMASS", "DUSMASS25", "SSSMASS25"]] * KG_M3_TO_UG_M3
     return c["DUSMASS25"] + c["OCSMASS"] + c["BCSMASS"] + c["SSSMASS25"] + c["SO4SMASS"] * 1.375
 
 
 # ---------------------------------------------------------------------------
-# 1b. Ground-truth bias validation (thesis Section "Ground Truth Validation
-# Dataset" / Data Generation Steps 4.1-4.2) -- shared by BOTH the OpenAQ
-# Manila hourly comparison and any EMB-DENR annual comparison. Purely
-# descriptive: characterizes bias, does not feed back into training.
+# 1b. Bias validation
 # ---------------------------------------------------------------------------
 def compute_bias_metrics(model_values: pd.Series, obs_values: pd.Series) -> dict:
-    """model_values, obs_values: aligned (same index/order) PM2.5 series --
-    one from your derived MERRA-2 data, one from an independent ground-truth
-    source (OpenAQ sensor readings, or EMB-DENR reported averages).
-    Returns Pearson r, Mean Bias Error (model - obs), and RMSE."""
+    # Pearson r, MBE, RMSE
     r, _ = stats.pearsonr(model_values, obs_values)
     mbe = float((model_values - obs_values).mean())
     rmse = float(np.sqrt(((model_values - obs_values) ** 2).mean()))
@@ -74,24 +49,13 @@ def compute_bias_metrics(model_values: pd.Series, obs_values: pd.Series) -> dict
 
 
 # ---------------------------------------------------------------------------
-# 1c. BLH gap-filling from an alternate source (MERRA-2 PBLH), for the ~6-month
-# boundary_layer_height gap found in ERA5 (Jan-Jun 2024, 4368 hours/city).
-# Two-step process: (1) quantify systematic bias between ERA5's BLH and
-# MERRA-2's PBLH during a period where BOTH exist, (2) only then decide
-# whether/how to correct MERRA-2's values before filling ERA5's gap with them.
-# Never fill blindly -- MERRA-2's PBLH uses a different definition (eddy
-# diffusion coefficient method) and is documented in the literature to run
-# systematically shallower than other boundary-layer-height products.
+# 1c. BLH gap-fill
 # ---------------------------------------------------------------------------
 def compare_blh_sources(era5_blh: pd.DataFrame, merra2_pblh: pd.DataFrame) -> dict:
-    """era5_blh: columns [city, datetime, boundary_layer_height], non-null rows only.
-    merra2_pblh: columns [city, datetime, PBLH].
-    Returns bias stats over whatever overlap exists between the two (should be
-    all months OUTSIDE the known gap, since that's where ERA5 has real values
-    to compare against)."""
+    # bias check, overlap only
     merged = era5_blh.merge(merra2_pblh, on=["city", "datetime"], how="inner")
     if len(merged) == 0:
-        raise ValueError("No overlapping (city, datetime) rows between ERA5 and MERRA-2 PBLH -- check merge keys.")
+        raise ValueError("no overlap rows")
     diff = merged["PBLH"] - merged["boundary_layer_height"]
     return {
         "n_overlap_hours": len(merged),
@@ -108,13 +72,7 @@ def fill_blh_gap(
     merra2_pblh: pd.DataFrame,
     bias_correction: float = 0.0,
 ) -> pd.DataFrame:
-    """Fills NaN boundary_layer_height rows in era5_df using MERRA-2 PBLH,
-    optionally shifted by `bias_correction` (e.g. the mean_diff from
-    compare_blh_sources, applied with the right sign to bring MERRA-2 values
-    onto ERA5's scale: corrected = PBLH - mean_diff_merra2_minus_era5).
-    Adds a `blh_source` column ('era5' or 'merra2_gapfill') so every value's
-    provenance stays traceable -- required before this is defensible in a
-    methodology write-up, per the "flag, don't silently fix" principle."""
+    # fill NaNs, tag source
     df = era5_df.copy()
     df["blh_source"] = np.where(df["boundary_layer_height"].isna(), "merra2_gapfill", "era5")
 
@@ -125,8 +83,7 @@ def fill_blh_gap(
 
     n_unfillable = np.isnan(fill_values).sum()
     if n_unfillable > 0:
-        print(f"WARNING: {n_unfillable} gap rows have no matching MERRA-2 PBLH value "
-              f"(city/datetime not found) -- these remain NaN.")
+        print(f"WARNING: {n_unfillable} rows unfilled")  # no match found
 
     df.loc[missing_mask, "boundary_layer_height"] = fill_values
     return df
@@ -138,7 +95,7 @@ def fill_blh_gap(
 def merge_datasets(pm25_df: pd.DataFrame, met_df: pd.DataFrame) -> pd.DataFrame:
     merged = pm25_df.merge(met_df, on=["city", "datetime"], how="inner")
     merged = merged.sort_values(["city", "datetime"]).reset_index(drop=True)
-    assert not merged.duplicated(["city", "datetime"]).any(), "duplicate city-hour rows after merge"
+    assert not merged.duplicated(["city", "datetime"]).any(), "dup rows"
     return merged
 
 
@@ -162,8 +119,7 @@ def validate_merged(df: pd.DataFrame) -> dict:
 # 4. Missing value handling
 # ---------------------------------------------------------------------------
 def interpolate_gaps(city_df: pd.DataFrame, max_gap_hours: int = 3) -> pd.DataFrame:
-    """Linear interpolation for gaps <= max_gap_hours; longer gaps are left
-    as NaN so downstream windowing can exclude them (thesis Step 5)."""
+    # fill short gaps only
     city_df = city_df.set_index("datetime").sort_index()
     full_index = pd.date_range(city_df.index.min(), city_df.index.max(), freq="h")
     city_df = city_df.reindex(full_index)
@@ -189,16 +145,16 @@ def chronological_split(df: pd.DataFrame, cutoff_1, cutoff_2) -> tuple[pd.DataFr
     train = df[df["datetime"] < cutoff_1].copy()
     val = df[(df["datetime"] >= cutoff_1) & (df["datetime"] < cutoff_2)].copy()
     test = df[df["datetime"] >= cutoff_2].copy()
-    assert train["datetime"].max() < val["datetime"].min()
-    assert val["datetime"].max() < test["datetime"].min()
+    assert train["datetime"].max() < val["datetime"].min()  # no leak
+    assert val["datetime"].max() < test["datetime"].min()  # no leak
     return train, val, test
 
 
 # ---------------------------------------------------------------------------
-# 6. Scaling (fit on TRAIN only)
+# 6. Scaling
 # ---------------------------------------------------------------------------
 def fit_transform_split(train_df, val_df, test_df, cols: Sequence[str] = FEATURE_COLS):
-    scaler = StandardScaler()
+    scaler = StandardScaler()  # fit train only
     train_df = train_df.copy()
     val_df = val_df.copy()
     test_df = test_df.copy()
@@ -209,15 +165,10 @@ def fit_transform_split(train_df, val_df, test_df, cols: Sequence[str] = FEATURE
 
 
 # ---------------------------------------------------------------------------
-# 7. Sliding window generation
+# 7. Sliding windows
 # ---------------------------------------------------------------------------
 def make_windows_for_city(city_df: pd.DataFrame, L: int = 48, H: int = 24):
-    """city_df: single city, sorted by datetime, already scaled.
-    Returns X_pm25 (n,L,1), X_met (n,L,7), Y (n,H), start_ts (n,), end_ts (n,)
-    -- the first input timestep and last target timestep of each window,
-    used to assign windows to a split (and to detect boundary-crossing
-    windows). Windows containing any NaN (from an un-interpolated long
-    gap) are dropped."""
+    # one city, 48-in 24-out
     pm25 = city_df["pm25"].to_numpy()
     met = city_df[MET_COLS].to_numpy()
     dt = city_df["datetime"].to_numpy()
@@ -231,7 +182,7 @@ def make_windows_for_city(city_df: pd.DataFrame, L: int = 48, H: int = 24):
         x_met_w = met[in_slice]
         y = pm25[out_slice]
         if np.isnan(x_pm).any() or np.isnan(x_met_w).any() or np.isnan(y).any():
-            continue  # drop windows spanning an un-interpolated gap
+            continue  # skip gap window
         X_pm25.append(x_pm[:, None])
         X_met.append(x_met_w)
         Y.append(y)
@@ -256,11 +207,7 @@ def _assign_split(t, cutoff_1, cutoff_2) -> str:
 
 
 def build_dataset(scaled_df: pd.DataFrame, cutoff_1, cutoff_2, L: int = 48, H: int = 24):
-    """Generate windows PER CITY (never crossing a city boundary). A window
-    is assigned to a split only if its start AND end timestamps fall in the
-    SAME split; windows whose span crosses a split boundary are dropped
-    entirely (implementation guide Section 15 -- this rule is a documented
-    ASSUMPTION, not literally specified in the thesis)."""
+    # per-city windows, drop boundary crossers
     splits = {"train": [], "val": [], "test": []}
     n_dropped_boundary = 0
     for city, city_df in scaled_df.groupby("city"):

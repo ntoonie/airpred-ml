@@ -17,7 +17,7 @@ data:
   split_method: "global_chronological_cutoff"   # ASSUMPTION -- see guide Section 13
   max_interpolation_gap_hours: 3
   pm25_implausible_threshold: 500   # µg/m3
-  pm25_derivation_formula: "TODO — RESOLVE guide Section 7 BEFORE RUNNING PREPROCESSING"
+  pm25_derivation_formula: "nasa_gmao"   # RESOLVED -- see guide Section 7 and chat findings (SO4SMASS confirmed)
 
 model:
   tcn_blocks: 4
@@ -41,7 +41,7 @@ training:
   loss: mse
   weight_decay: 0.0           # TODO — NOT SPECIFIED IN THESIS
   random_seed: 42             # TODO — NOT SPECIFIED IN THESIS, pick and document
-  device: cuda                # Google Colab T4 GPU per thesis Research Instrument
+  device: cuda                # overridden automatically by train_local.py / the Colab notebooks based on actual GPU availability
 
 evaluation:
   metrics: [rmse, mae, mape, r2]
