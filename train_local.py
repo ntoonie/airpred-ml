@@ -10,6 +10,8 @@ USAGE:
     python train_local.py --seeds 42 123 7 2024 99  # explicit seed list
     python train_local.py --keep-checkpoints        # keep all (variant, seed) checkpoints,
                                                       # not just each variant's best seed
+    python train_local.py --variants D --seeds 42   # run just one variant, one seed
+                                                      # (e.g. a quick diagnostic re-run)
 
 PREREQUISITES:
   1. Stage 1 must have already run (in Colab, as before) and produced
@@ -76,7 +78,14 @@ def main():
         help="Keep every (variant, seed) checkpoint instead of only each "
              "variant's best-seed checkpoint.",
     )
+    parser.add_argument(
+        "--variants", type=str, nargs="+", default=list(VARIANTS.keys()),
+        choices=list(VARIANTS.keys()),
+        help=f"Which variants to run (default: all {list(VARIANTS.keys())}). "
+             f"E.g. --variants D for a quick single-variant diagnostic run.",
+    )
     args = parser.parse_args()
+    variants_to_run = {name: VARIANTS[name] for name in args.variants}
 
     cfg = yaml.safe_load(open("configs/config.yaml"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,7 +115,7 @@ def main():
     all_results: dict[tuple[str, int], float] = {}
 
     for seed in args.seeds:
-        for name, ModelClass in VARIANTS.items():
+        for name, ModelClass in variants_to_run.items():
             print(f"\n{'='*60}\nTraining Variant {name} -- seed {seed}\n{'='*60}")
             set_seed(seed)  # same placement as the earlier fix: before model construction
             model = build_model(name, ModelClass, horizon, cfg)
@@ -126,7 +135,7 @@ def main():
     # Aggregate: mean +/- std per variant across seeds.
     print(f"\n{'='*60}\nAggregate across {len(args.seeds)} seeds\n{'='*60}")
     summary = {}
-    for name in VARIANTS:
+    for name in variants_to_run:
         vals = np.array([all_results[(name, s)] for s in args.seeds])
         summary[name] = (float(vals.mean()), float(vals.std()))
         print(f"Variant {name}: mean={vals.mean():.4f}  std={vals.std():.4f}  (n={len(vals)})")
@@ -136,7 +145,7 @@ def main():
     # len(VARIANTS) x len(seeds) checkpoints -- each only a few MB for a
     # model this size -- so this is a convenience default, not a necessity.
     if not args.keep_checkpoints:
-        for name in VARIANTS:
+        for name in variants_to_run:
             best_seed = min(args.seeds, key=lambda s: all_results[(name, s)])
             for seed in args.seeds:
                 if seed == best_seed:

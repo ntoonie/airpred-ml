@@ -1,5 +1,4 @@
-"""Shared training loop for all four variants (thesis Data Generation Step 10:
-identical hyperparameters across all variants to ensure fair comparison)."""
+"""Shared training loop for all four variants (thesis Data Generation Step 10: identical hyperparameters across all variants to ensure fair comparison)."""
 from __future__ import annotations
 
 import random
@@ -43,6 +42,7 @@ def train_variant(model, train_data, val_data, cfg: dict, ckpt_path: str) -> flo
 
     for epoch in range(cfg["training"]["max_epochs"]):
         model.train()
+        train_sq_err, train_n = 0.0, 0
         for x_pm25, x_met, y in train_loader:
             x_pm25, x_met, y = x_pm25.to(device), x_met.to(device), y.to(device)
             opt.zero_grad()
@@ -50,6 +50,17 @@ def train_variant(model, train_data, val_data, cfg: dict, ckpt_path: str) -> flo
             loss = loss_fn(y_hat, y)
             loss.backward()
             opt.step()
+
+            # Accumulated from each batch's forward pass BEFORE that batch's
+            # weight update -- the standard "running train loss" approximation.
+            # Cheap: reuses y_hat already computed for the backward pass, no
+            # second pass over the training set. Good enough to distinguish
+            # "train loss keeps falling, val rises" (overfitting) from
+            # "train loss itself is unstable" (LR/architecture issue) --
+            # not an exact end-of-epoch train RMSE at fixed weights.
+            train_sq_err += ((y_hat.detach() - y) ** 2).sum().item()
+            train_n += y.numel()
+        train_rmse = (train_sq_err / train_n) ** 0.5
 
         model.eval()
         sq_err, n = 0.0, 0
@@ -60,7 +71,10 @@ def train_variant(model, train_data, val_data, cfg: dict, ckpt_path: str) -> flo
                 sq_err += ((y_hat - y) ** 2).sum().item()
                 n += y.numel()
         val_rmse = (sq_err / n) ** 0.5
-        print(f"epoch {epoch:3d}  val_rmse={val_rmse:.4f}  patience_left={patience_left}")
+        print(
+            f"epoch {epoch:3d}  train_rmse={train_rmse:.4f}  "
+            f"val_rmse={val_rmse:.4f}  patience_left={patience_left}"
+        )
 
         if val_rmse < best_val_rmse:
             best_val_rmse = val_rmse
