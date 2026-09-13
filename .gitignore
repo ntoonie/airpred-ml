@@ -1,5 +1,7 @@
 venv/
 .venv/
-__pycache__/
-*.pyc
+pycache/
+.pyc
 .env
+data/final/.npz
+**/pycache/
