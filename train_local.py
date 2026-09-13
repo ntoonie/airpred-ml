@@ -1,9 +1,15 @@
 """Local equivalent of AIRPRED_Stage2_Colab.ipynb -- trains all four variants
-on a local machine's GPU instead of Colab's. Same logic, same config.yaml,
-no Colab-specific code (no Drive mount, no upload widgets).
+on a local machine's GPU instead of Colab's. Now runs each variant across
+multiple random seeds, since RQ2/RQ3 are close enough that a single seed's
+result can't be trusted on its own (see prior run: direction flipped between
+an unseeded and a seeded run).
 
 USAGE:
-    python train_local.py
+    python train_local.py                          # default seed sweep (42, 123, 2024, 7, 99)
+    python train_local.py --seeds 42                # single seed, old behavior
+    python train_local.py --seeds 42 123 7 2024 99  # explicit seed list
+    python train_local.py --keep-checkpoints        # keep all (variant, seed) checkpoints,
+                                                      # not just each variant's best seed
 
 PREREQUISITES:
   1. Stage 1 must have already run (in Colab, as before) and produced
@@ -15,9 +21,10 @@ PREREQUISITES:
 """
 from __future__ import annotations
 
+import argparse
+import csv
 import os
 import yaml
-import joblib
 import numpy as np
 import torch
 
@@ -27,10 +34,20 @@ from src.models.variants import (
     VariantC_AIRPRED,
     VariantD_PM25Only,
 )
-from src.training.train import train_variant
+from src.training.train import train_variant, set_seed
 
 DATA_DIR = "data/final"
 CKPT_DIR = "checkpoints"
+RESULTS_CSV = "results/multiseed_val_rmse.csv"
+
+DEFAULT_SEEDS = [42, 123, 2024, 7, 99]
+
+VARIANTS = {
+    "A": VariantA_SingleBranchUnified,
+    "B": VariantB_DualBranchConcat,
+    "C": VariantC_AIRPRED,
+    "D": VariantD_PM25Only,
+}
 
 
 def load_split(name: str):
@@ -38,7 +55,29 @@ def load_split(name: str):
     return d["X_pm25"], d["X_met"], d["Y"], d["cities"]
 
 
+def build_model(name: str, ModelClass, horizon: int, cfg: dict):
+    if name != "C":
+        return ModelClass(horizon=horizon)
+    return ModelClass(
+        horizon=horizon,
+        d_model=cfg["model"]["d_model"],
+        num_heads=cfg["model"]["num_attention_heads"],
+    )
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--seeds", type=int, nargs="+", default=DEFAULT_SEEDS,
+        help=f"Seeds to run each variant with (default: {DEFAULT_SEEDS})",
+    )
+    parser.add_argument(
+        "--keep-checkpoints", action="store_true",
+        help="Keep every (variant, seed) checkpoint instead of only each "
+             "variant's best-seed checkpoint.",
+    )
+    args = parser.parse_args()
+
     cfg = yaml.safe_load(open("configs/config.yaml"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg["training"]["device"] = device
@@ -57,34 +96,58 @@ def main():
     print(f"val:   {[a.shape for a in val_data]}")
     print("Check: val sample count should be ~18,000-21,000 (post BLH-fix), not ~950.\n")
 
-    VARIANTS = {
-        "A": VariantA_SingleBranchUnified,
-        "B": VariantB_DualBranchConcat,
-        "C": VariantC_AIRPRED,
-        "D": VariantD_PM25Only,
-    }
     horizon = cfg["data"]["forecast_horizon"]
     os.makedirs(CKPT_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(RESULTS_CSV), exist_ok=True)
 
-    best_val_rmses = {}
-    for name, ModelClass in VARIANTS.items():
-        print(f"\n{'='*60}\nTraining Variant {name}\n{'='*60}")
-        model = (
-            ModelClass(horizon=horizon)
-            if name != "C"
-            else ModelClass(
-                horizon=horizon,
-                d_model=cfg["model"]["d_model"],
-                num_heads=cfg["model"]["num_attention_heads"],
-            )
-        )
-        ckpt_path = f"{CKPT_DIR}/variant_{name.lower()}_best.pt"
-        best_rmse = train_variant(model, train_data, val_data, cfg, ckpt_path)
-        best_val_rmses[name] = best_rmse
-        print(f"Variant {name} best val RMSE (scaled units): {best_rmse:.4f}")
+    print(f"Seeds this run: {args.seeds}\n")
 
-    print("\nAll four variants trained. Checkpoints saved to", CKPT_DIR)
-    print(best_val_rmses)
+    # (variant, seed) -> best_val_rmse
+    all_results: dict[tuple[str, int], float] = {}
+
+    for seed in args.seeds:
+        for name, ModelClass in VARIANTS.items():
+            print(f"\n{'='*60}\nTraining Variant {name} -- seed {seed}\n{'='*60}")
+            set_seed(seed)  # same placement as the earlier fix: before model construction
+            model = build_model(name, ModelClass, horizon, cfg)
+            ckpt_path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}_best.pt"
+            best_rmse = train_variant(model, train_data, val_data, cfg, ckpt_path)
+            all_results[(name, seed)] = best_rmse
+            print(f"Variant {name}, seed {seed} -- best val RMSE (scaled): {best_rmse:.4f}")
+
+    # Every (variant, seed) result goes to CSV so nothing has to be re-derived from logs later.
+    with open(RESULTS_CSV, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["variant", "seed", "best_val_rmse"])
+        for (name, seed), rmse in all_results.items():
+            writer.writerow([name, seed, f"{rmse:.6f}"])
+    print(f"\nPer-(variant, seed) results written to {RESULTS_CSV}")
+
+    # Aggregate: mean +/- std per variant across seeds.
+    print(f"\n{'='*60}\nAggregate across {len(args.seeds)} seeds\n{'='*60}")
+    summary = {}
+    for name in VARIANTS:
+        vals = np.array([all_results[(name, s)] for s in args.seeds])
+        summary[name] = (float(vals.mean()), float(vals.std()))
+        print(f"Variant {name}: mean={vals.mean():.4f}  std={vals.std():.4f}  (n={len(vals)})")
+
+    # Housekeeping: by default, keep only the checkpoint for each variant's
+    # best-performing seed and delete the rest. A full sweep produces
+    # len(VARIANTS) x len(seeds) checkpoints -- each only a few MB for a
+    # model this size -- so this is a convenience default, not a necessity.
+    if not args.keep_checkpoints:
+        for name in VARIANTS:
+            best_seed = min(args.seeds, key=lambda s: all_results[(name, s)])
+            for seed in args.seeds:
+                if seed == best_seed:
+                    continue
+                path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}_best.pt"
+                if os.path.exists(path):
+                    os.remove(path)
+        print("\nKept only each variant's best-seed checkpoint (pass --keep-checkpoints to keep all).")
+
+    print("\nDone.")
+    print(summary)
 
 
 if __name__ == "__main__":
