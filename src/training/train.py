@@ -2,8 +2,20 @@
 identical hyperparameters across all variants to ensure fair comparison)."""
 from __future__ import annotations
 
+import random
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+
+
+def set_seed(seed: int) -> None:
+    """Makes weight init, dropout, and data shuffling reproducible across runs.
+    Call once per variant, right before building the model, so A/B/C/D all
+    start from the same reproducible random state rather than an arbitrary one."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # no-op safely if no GPU present
 
 
 def make_loader(X_pm25, X_met, Y, batch_size: int, shuffle: bool) -> DataLoader:
@@ -14,7 +26,10 @@ def make_loader(X_pm25, X_met, Y, batch_size: int, shuffle: bool) -> DataLoader:
 
 
 def train_variant(model, train_data, val_data, cfg: dict, ckpt_path: str) -> float:
-    """train_data / val_data: (X_pm25, X_met, Y) numpy tuples."""
+    """train_data / val_data: (X_pm25, X_met, Y) numpy tuples.
+    NOTE: call set_seed() in the CALLING code, before constructing `model` --
+    seeding here is too late, since weight initialization already happened
+    by the time this function receives the model object."""
     device = cfg["training"]["device"]
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg["training"]["learning_rate"])
