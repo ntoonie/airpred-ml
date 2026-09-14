@@ -49,8 +49,13 @@ evaluation:
   alpha: 0.05
 
 statistical_tests:
+  H1: {proposed: C, baseline: A}   # the literal Chapter 1 hypothesis -- AIRPRED vs
+                                     # single-branch unified encoding + concat fusion.
+                                     # Distinct from RQ1-3's pairwise ablation chain --
+                                     # add this explicitly rather than inferring it from
+                                     # RQ1+RQ2 holding, since that's an assumption, not a test.
   RQ1: {proposed: B, baseline: A}
   RQ2: {proposed: C, baseline: B}
   RQ3: {proposed: C, baseline: D}
   test: paired_t_test
-  paired_unit: "per_window_rmse"   # ASSUMPTION — see guide Section 27
+  paired_unit: "per_window_rmse"   # ASSUMPTION — see guide Section 27ss
