@@ -26,9 +26,28 @@ class CrossModalAttentionFusion(nn.Module):
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        self.q_proj = nn.Linear(branch_dim, d_model)
-        self.k_proj = nn.Linear(branch_dim, d_model)
-        self.v_proj = nn.Linear(branch_dim, d_model)
+        # nn.MultiheadAttention's query path always requires its input dim to
+        # equal embed_dim -- kdim/vdim can differ from embed_dim, but there's
+        # no separate "qdim". So branch_dim must equal d_model for h_pm25 to
+        # be usable directly as the query below. If these ever need to
+        # differ, add an explicit query-only projection before self.mha
+        # (and remove this assert) -- do NOT add separate K/V projections
+        # too, since nn.MultiheadAttention already provides those internally.
+        assert branch_dim == d_model, (
+            f"branch_dim ({branch_dim}) must equal d_model ({d_model}) -- "
+            f"see comment above for why, and what to do if this changes."
+        )
+        # nn.MultiheadAttention already applies its own internal Q/K/V linear
+        # projections (in_proj_weight) before computing attention -- that IS
+        # the "Query/Key/Value Projection (Linear)" step from thesis Table 5.
+        # Passing raw h_pm25 / h_met directly (not pre-projected) is correct
+        # usage. The previous version of this file applied separate
+        # q_proj/k_proj/v_proj layers in front of this -- stacking a second
+        # linear transform with no nonlinearity in between adds ~49.5K
+        # parameters with zero additional representational power (two
+        # stacked linear layers collapse to one, algebraically), which likely
+        # made this module modestly harder to optimize within the same fixed
+        # epoch budget every other variant gets, for no benefit.
         self.mha = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=num_heads, batch_first=True, dropout=dropout
         )
@@ -44,11 +63,8 @@ class CrossModalAttentionFusion(nn.Module):
 
     def forward(self, h_pm25: torch.Tensor, h_met: torch.Tensor):
         """h_pm25, h_met: (B, L, branch_dim) -> fused (B, L, fused_dim), attn (B, h, L, L)."""
-        q = self.q_proj(h_pm25)
-        k = self.k_proj(h_met)
-        v = self.v_proj(h_met)
         attn_out, attn_weights = self.mha(
-            q, k, v, need_weights=True, average_attn_weights=False
+            h_pm25, h_met, h_met, need_weights=True, average_attn_weights=False
         )
         z = self.norm1(attn_out + self.residual_proj(h_pm25))
         z = self.norm2(self.ffn(z) + z)
