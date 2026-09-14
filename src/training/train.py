@@ -15,6 +15,13 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)  # no-op safely if no GPU present
+    # torch.manual_seed alone does NOT make CUDA convolutions deterministic --
+    # cuDNN can pick non-deterministic algorithms (e.g. atomic-add-based
+    # backward passes) whose tiny per-step floating-point differences compound
+    # over thousands of optimizer steps into a visibly different result by
+    # epoch 2+, even with the "same" seed. These two flags fix that.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def make_loader(X_pm25, X_met, Y, batch_size: int, shuffle: bool) -> DataLoader:
