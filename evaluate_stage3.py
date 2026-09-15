@@ -1,18 +1,10 @@
-"""Stage 3 evaluation (thesis Steps 15-16): load one checkpoint per variant,
-run inference on the held-out 20% test set, compute RMSE/MAE/MAPE/R^2
-(thesis Tables 9-12), and run the three paired t-tests specified in
-config.yaml's statistical_tests block (thesis Table 13).
-
-USAGE:
-    python evaluate_stage3.py                # uses seed-42 checkpoints by default
-    python evaluate_stage3.py --seed 42       # explicit, same as above
-"""
 from __future__ import annotations
 
 import argparse
 import json
 import os
 
+import joblib
 import numpy as np
 import torch
 import yaml
@@ -40,6 +32,27 @@ VARIANTS = {
 def load_split(name: str):
     d = np.load(f"{DATA_DIR}/{name}.npz", allow_pickle=True)
     return d["X_pm25"], d["X_met"], d["Y"], d["cities"]
+
+
+def load_pm25_inverse_transform(data_dir: str):
+    """The scaler is a single StandardScaler fit across all 8 columns
+    (PM2.5 + 7 met vars) together, keyed by feature_names_in_ -- NOT one
+    scaler per feature. Y (the forecast target) is assumed to have been
+    normalized with this same PM2.5 column's mean/scale, since it's the
+    same physical quantity as the PM2.5 input stream, just future
+    timesteps. This is a reasonable inference, not a documented thesis
+    fact -- the printed sanity-check range after inverse-transforming is
+    there so you can visually confirm it lands in a plausible PM2.5 range
+    rather than trusting this silently."""
+    scaler = joblib.load(f"{data_dir}/scaler.pkl")
+    pm25_idx = list(scaler.feature_names_in_).index("pm25")
+    mean, scale = float(scaler.mean_[pm25_idx]), float(scaler.scale_[pm25_idx])
+    print(f"PM2.5 scaler: mean={mean:.4f}  scale={scale:.4f}  (column index {pm25_idx})")
+
+    def inverse(arr: np.ndarray) -> np.ndarray:
+        return arr * scale + mean
+
+    return inverse
 
 
 def build_model(name: str, ModelClass, horizon: int, cfg: dict):
@@ -100,6 +113,16 @@ def main():
     X_pm25, X_met, Y, cities = load_split("test")
     print(f"test: X_pm25={X_pm25.shape}  X_met={X_met.shape}  Y={Y.shape}\n")
 
+    inverse_pm25 = load_pm25_inverse_transform(DATA_DIR)
+    Y = inverse_pm25(Y)
+    print(
+        f"Real-unit PM2.5 range (test set actuals): "
+        f"min={Y.min():.2f}  max={Y.max():.2f}  mean={Y.mean():.2f}  µg/m³\n"
+        f"(sanity check -- should look like plausible Philippine PM2.5 levels, "
+        f"roughly single-to-low-double digits on average, not near-zero or in "
+        f"the hundreds on average)\n"
+    )
+
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     predictions: dict[str, np.ndarray] = {}
@@ -117,6 +140,7 @@ def main():
         model.to(device)
 
         y_hat = run_inference(model, X_pm25, X_met, device)
+        y_hat = inverse_pm25(y_hat)
         predictions[name] = y_hat
 
         rmse = float(np.sqrt(((Y - y_hat) ** 2).mean()))
@@ -126,7 +150,7 @@ def main():
         metrics[name] = {"rmse": rmse, "mae": mae, "mape": m_mape, "r2": m_r2}
         per_window[name] = per_window_rmse(Y, y_hat)
 
-        print(f"Variant {name}: RMSE={rmse:.4f}  MAE={mae:.4f}  "
+        print(f"Variant {name}: RMSE={rmse:.4f} µg/m³  MAE={mae:.4f} µg/m³  "
               f"MAPE={m_mape:.2f}%  R2={m_r2:.4f}")
 
     # Paired t-tests, exactly as specified in config.yaml's statistical_tests block.
@@ -156,7 +180,11 @@ def main():
 
     out_path = f"{RESULTS_DIR}/stage3_metrics_seed{args.seed}.json"
     with open(out_path, "w") as f:
-        json.dump({"seed": args.seed, "metrics": metrics, "paired_t_tests": rq_results}, f, indent=2)
+        json.dump(
+            {"seed": args.seed, "units": "µg/m³ (inverse-transformed via scaler.pkl)",
+             "metrics": metrics, "paired_t_tests": rq_results},
+            f, indent=2,
+        )
     print(f"\nMetrics + t-tests written to {out_path}")
 
     # Predictions themselves (not just summary metrics) are also saved -- these
