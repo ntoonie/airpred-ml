@@ -1,0 +1,68 @@
+{
+  "seed": 42,
+  "units": "\u00b5g/m\u00b3 (inverse-transformed via scaler.pkl)",
+  "metrics": {
+    "A": {
+      "rmse": 6.2385945320129395,
+      "mae": 4.041285037994385,
+      "mape": 32.90609121322632,
+      "r2": 0.19663792848587036
+    },
+    "B": {
+      "rmse": 6.138174533843994,
+      "mae": 3.964719772338867,
+      "mape": 32.734790444374084,
+      "r2": 0.22229242324829102
+    },
+    "C": {
+      "rmse": 5.885563373565674,
+      "mae": 3.7940521240234375,
+      "mape": 31.373170018196106,
+      "r2": 0.28498703241348267
+    },
+    "D": {
+      "rmse": 6.25236177444458,
+      "mae": 4.149303436279297,
+      "mape": 35.26233434677124,
+      "r2": 0.19308829307556152
+    }
+  },
+  "paired_t_tests": {
+    "H1": {
+      "proposed": "C",
+      "baseline": "A",
+      "t_statistic": -38.14823913574219,
+      "p_value": 0.0,
+      "significant_at_alpha": true,
+      "mean_rmse_proposed": 4.578594207763672,
+      "mean_rmse_baseline": 4.845014572143555
+    },
+    "RQ1": {
+      "proposed": "B",
+      "baseline": "A",
+      "t_statistic": -14.092512130737305,
+      "p_value": 0.0,
+      "significant_at_alpha": true,
+      "mean_rmse_proposed": 4.751476764678955,
+      "mean_rmse_baseline": 4.845014572143555
+    },
+    "RQ2": {
+      "proposed": "C",
+      "baseline": "B",
+      "t_statistic": -29.148103713989258,
+      "p_value": 0.0,
+      "significant_at_alpha": true,
+      "mean_rmse_proposed": 4.578594207763672,
+      "mean_rmse_baseline": 4.751476764678955
+    },
+    "RQ3": {
+      "proposed": "C",
+      "baseline": "D",
+      "t_statistic": -40.47470474243164,
+      "p_value": 0.0,
+      "significant_at_alpha": true,
+      "mean_rmse_proposed": 4.578594207763672,
+      "mean_rmse_baseline": 4.9094719886779785
+    }
+  }
+}

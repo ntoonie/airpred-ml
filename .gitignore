@@ -5,3 +5,6 @@ pycache/
 .env
 data/final/.npz
 **/pycache/
+demo_inputs.npz
+data/final/train.npz
+data/final/
