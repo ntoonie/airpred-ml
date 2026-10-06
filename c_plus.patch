@@ -1,0 +1,546 @@
+diff -ruN '--exclude=docs' orig_tree/configs/config.yaml /mnt/user-data/outputs/c_plus/configs/config.yaml
+--- orig_tree/configs/config.yaml	2026-10-06 21:39:25.916973375 +0800
++++ /mnt/user-data/outputs/c_plus/configs/config.yaml	2026-10-06 21:39:25.855198693 +0800
+@@ -31,6 +31,26 @@
+   forecast_head_dropout: 0.1
+   tcn_block_dropout: 0.0     # TODO — NOT SPECIFIED IN THESIS, guide Section 17
+ 
++  # --- C+ (improved AIRPRED) -- used ONLY by variants CMS / CATT / CPLUS / CPLUSBI.
++  # Variants A, B, C, D ignore this block, so the original results are unaffected.
++  # Variant presets pin only the flags they name (see src/models/variants.py);
++  # everything else is read from here.
++  c_plus:
++    tcn_channels: [64, 64, 128, 128]
++    dilations: [1, 2, 4, 8]
++    kernel_size: 3
++    tcn_block_dropout: 0.0
++    d_model: 128
++    num_attention_heads: 4
++    ffn_dim: 256
++    fused_dim: 256
++    multi_scale: true               # read out every tapped TCN block (RF 5/13/29/61), 1x1-project, concat
++    ms_taps: null                   # null = all blocks; or e.g. [1, 3]
++    input_norm: true                # LayerNorm on branch outputs before attention
++    attention_dropout: 0.1          # candidates: 0.0, 0.1, 0.2
++    ffn_dropout: 0.1
++    bidirectional_attention: false  # true = also meteorology->Q, PM2.5->K/V (preset CPLUSBI forces true)
++
+ training:
+   optimizer: adam
+   learning_rate: 1.0e-3
+diff -ruN '--exclude=docs' orig_tree/finetune_openaq.py /mnt/user-data/outputs/c_plus/finetune_openaq.py
+--- orig_tree/finetune_openaq.py	2026-10-06 21:39:25.918920925 +0800
++++ /mnt/user-data/outputs/c_plus/finetune_openaq.py	2026-10-06 21:39:25.860478807 +0800
+@@ -70,12 +70,7 @@
+ from torch.utils.data import DataLoader, TensorDataset
+ 
+ from src.evaluation.evaluate import compute_metrics, evaluate_model, inverse_scale_pm25
+-from src.models.variants import (
+-    VariantA_SingleBranchUnified,
+-    VariantB_DualBranchConcat,
+-    VariantC_AIRPRED,
+-    VariantD_PM25Only,
+-)
++from src.models.variants import VARIANT_KEYS, build_variant
+ from src.preprocessing.preprocessing import (
+     FEATURE_COLS,
+     build_dataset,
+@@ -84,12 +79,8 @@
+ )
+ from src.training.train import set_seed
+ 
+-VARIANTS = {
+-    "A": VariantA_SingleBranchUnified,
+-    "B": VariantB_DualBranchConcat,
+-    "C": VariantC_AIRPRED,
+-    "D": VariantD_PM25Only,
+-}
++VARIANTS = VARIANT_KEYS                       # A-D as before, plus the C+ ablation keys (CMS, CATT, CPLUS, CPLUSBI)
++DEFAULT_VARIANTS = ["A", "B", "C", "D"]
+ 
+ 
+ class ResidualWrapper(nn.Module):
+@@ -104,13 +95,7 @@
+ 
+ 
+ def build_model(name: str, horizon: int, cfg: dict):
+-    if name != "C":
+-        return VARIANTS[name](horizon=horizon)
+-    return VARIANTS[name](
+-        horizon=horizon,
+-        d_model=cfg["model"]["d_model"],
+-        num_heads=cfg["model"]["num_attention_heads"],
+-    )
++    return build_variant(name, horizon, cfg)
+ 
+ 
+ def load_city_frames(data_dir: str, cities: list[str] | None) -> pd.DataFrame:
+@@ -215,7 +200,7 @@
+     ap.add_argument("--ckpt-dir", default="checkpoints")
+     ap.add_argument("--seed", type=int, default=42, help="which ORIGINAL checkpoint seed to start from (default 42, what main.py serves)")
+     ap.add_argument("--seeds", type=int, nargs="+", default=[42], help="fine-tuning seeds (shuffling/dropout); several -> mean +/- std")
+-    ap.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS))
++    ap.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS, choices=VARIANTS)
+     ap.add_argument("--cities", nargs="+", default=None)
+     ap.add_argument("--lr", type=float, default=1e-4)
+     ap.add_argument("--epochs", type=int, default=30)
+@@ -293,7 +278,9 @@
+             set_seed(fs)
+             net = copy.deepcopy(base)
+             if args.attn_dropout > 0 and hasattr(net, "fusion"):
+-                net.fusion.mha.dropout = args.attn_dropout       # nn.MultiheadAttention reads .dropout in train mode
++                for m in net.fusion.modules():                   # C has one MHA; CPLUSBI has two
++                    if isinstance(m, nn.MultiheadAttention):
++                        m.dropout = args.attn_dropout            # nn.MultiheadAttention reads .dropout in train mode
+             if args.freeze_encoders:
+                 for pname, p in net.named_parameters():
+                     if "encoder" in pname:
+diff -ruN '--exclude=docs' orig_tree/src/models/attention.py /mnt/user-data/outputs/c_plus/src/models/attention.py
+--- orig_tree/src/models/attention.py	2026-10-06 21:39:25.913069413 +0800
++++ /mnt/user-data/outputs/c_plus/src/models/attention.py	2026-10-06 21:39:25.762895011 +0800
+@@ -72,6 +72,69 @@
+         return fused, attn_weights
+ 
+ 
++class CrossModalAttentionFusionPlus(nn.Module):
++    """Cross-modal attention for C+. CrossModalAttentionFusion is left untouched.
++
++    One-directional (default, the original AIRPRED mechanism):
++        PM2.5 -> Query, meteorology -> Key/Value  (attribute names mha/norm1/ffn/norm2,
++        so finetune_openaq.py's --attn-dropout hook keeps working).
++    Optional bidirectional (bidirectional=True, extra parameters):
++        additionally meteorology -> Query, PM2.5 -> Key/Value (mha_rev/...);
++        the two streams are concatenated and projected to fused_dim.
++
++    Additions over the original, each with one purpose:
++      input_norm        LayerNorm on both branch outputs before attention. TCN outputs are
++                        post-ReLU (non-negative, unbounded); normalising them keeps the
++                        attention logits in a stable range and, in multi-scale mode, puts
++                        the different-depth taps on a common scale.
++      attention_dropout dropout on the attention weights (regularisation; configurable).
++      ffn_dropout       dropout inside the feed-forward block (regularisation).
++    The residual connections and post-LayerNorms around attention and FFN already
++    existed in the original module and are kept as they were.
++    """
++
++    def __init__(self, d_model: int = 128, num_heads: int = 4, ffn_dim: int = 256,
++                 fused_dim: int = 256, attention_dropout: float = 0.0, ffn_dropout: float = 0.0,
++                 input_norm: bool = False, bidirectional: bool = False):
++        super().__init__()
++        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
++        self.bidirectional = bidirectional
++        self.norm_pm = nn.LayerNorm(d_model) if input_norm else nn.Identity()
++        self.norm_met = nn.LayerNorm(d_model) if input_norm else nn.Identity()
++
++        def ffn():
++            return nn.Sequential(nn.Linear(d_model, ffn_dim), nn.GELU(), nn.Dropout(ffn_dropout),
++                                 nn.Linear(ffn_dim, d_model))
++
++        self.mha = nn.MultiheadAttention(d_model, num_heads, batch_first=True, dropout=attention_dropout)
++        self.norm1, self.ffn, self.norm2 = nn.LayerNorm(d_model), ffn(), nn.LayerNorm(d_model)
++        if bidirectional:
++            self.mha_rev = nn.MultiheadAttention(d_model, num_heads, batch_first=True, dropout=attention_dropout)
++            self.norm1_rev, self.ffn_rev, self.norm2_rev = nn.LayerNorm(d_model), ffn(), nn.LayerNorm(d_model)
++        self.output_proj = nn.Linear(d_model * (2 if bidirectional else 1), fused_dim)
++
++    @staticmethod
++    def _block(mha, norm1, ffn, norm2, q, kv, need_weights):
++        attn_out, w = mha(q, kv, kv, need_weights=need_weights, average_attn_weights=False)
++        z = norm1(attn_out + q)
++        z = norm2(ffn(z) + z)
++        return z, w
++
++    def forward(self, h_pm25: torch.Tensor, h_met: torch.Tensor, need_weights: bool = False,
++                return_reverse: bool = False):
++        """h_pm25, h_met: (B, L, d_model) -> fused (B, L, fused_dim), attn (B, heads, L, L).
++        attn is the PM2.5->meteorology map (None unless need_weights). With
++        return_reverse=True (bidirectional only) a third value, the reverse map, is returned."""
++        p, m = self.norm_pm(h_pm25), self.norm_met(h_met)
++        z, w = self._block(self.mha, self.norm1, self.ffn, self.norm2, p, m, need_weights)
++        w_rev = None
++        if self.bidirectional:
++            z_rev, w_rev = self._block(self.mha_rev, self.norm1_rev, self.ffn_rev, self.norm2_rev, m, p, need_weights)
++            z = torch.cat([z, z_rev], dim=-1)
++        fused = self.output_proj(z)
++        return (fused, w, w_rev) if return_reverse else (fused, w)
++
++
+ if __name__ == "__main__":
+     fusion = CrossModalAttentionFusion()
+     h_pm25 = torch.randn(4, 48, 128)
+diff -ruN '--exclude=docs' orig_tree/src/models/tcn.py /mnt/user-data/outputs/c_plus/src/models/tcn.py
+--- orig_tree/src/models/tcn.py	2026-10-06 21:39:25.913090480 +0800
++++ /mnt/user-data/outputs/c_plus/src/models/tcn.py	2026-10-06 21:39:25.760548110 +0800
+@@ -82,6 +82,59 @@
+         return x.transpose(1, 2)  # (B, L, 128)
+ 
+ 
++class MultiScaleTCNEncoder(nn.Module):
++    """Configurable TCN encoder with optional multi-scale readout (used by C+).
++
++    Same blocks as TCNEncoder (two dilated causal convs per block, thesis Table 4),
++    but channels / dilations / kernel size come from config instead of class
++    constants. With multi_scale=False it behaves like TCNEncoder (last block only).
++
++    With multi_scale=True the output of every tapped block is read out, projected by a
++    1x1 conv to out_dim // n_taps channels and concatenated. Block k has cumulative
++    receptive field 1 + 2*(K-1)*sum(d_1..d_k) = 5, 13, 29, 61 steps for K=3 and
++    dilations 1, 2, 4, 8, so the readout mixes short-, medium- and long-range features
++    from ONE network instead of running several parallel TCNs. The 1x1 conv acts on the
++    channel axis only, so causality is preserved.
++    """
++
++    def __init__(self, in_channels: int, channels=(64, 64, 128, 128), dilations=(1, 2, 4, 8),
++                 kernel_size: int = 3, block_dropout: float = 0.0, multi_scale: bool = False,
++                 taps=None, out_dim: int | None = None):
++        super().__init__()
++        assert len(channels) == len(dilations), "channels and dilations must have the same length"
++        n_blocks = len(channels)
++        self.taps = list(range(n_blocks)) if (multi_scale and taps is None) else (list(taps) if multi_scale else [n_blocks - 1])
++        assert all(0 <= t < n_blocks for t in self.taps), f"taps {self.taps} out of range for {n_blocks} blocks"
++        n_use = max(self.taps) + 1                       # blocks after the last tap would be unused
++        blocks, prev = [], in_channels
++        for ch, d in list(zip(channels, dilations))[:n_use]:
++            blocks.append(TCNResidualBlock(prev, ch, kernel_size, d, dropout=block_dropout))
++            prev = ch
++        self.blocks = nn.ModuleList(blocks)
++        self.multi_scale = multi_scale
++        if multi_scale:
++            out_dim = out_dim or channels[-1]
++            assert out_dim % len(self.taps) == 0, f"out_dim {out_dim} must be divisible by the {len(self.taps)} taps"
++            self.tap_proj = nn.ModuleList(
++                [nn.Conv1d(channels[t], out_dim // len(self.taps), 1) for t in self.taps]
++            )
++            self.out_channels = out_dim
++        else:
++            self.tap_proj = None
++            self.out_channels = channels[self.taps[0]]
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, L, C_in) -> (B, L, out_channels)
++        x = x.transpose(1, 2)
++        feats = []
++        for i, block in enumerate(self.blocks):
++            x = block(x)
++            if self.multi_scale and i in self.taps:
++                feats.append(x)
++        if self.multi_scale:
++            x = torch.cat([proj(f) for proj, f in zip(self.tap_proj, feats)], dim=1)
++        return x.transpose(1, 2)
++
++
+ if __name__ == "__main__":
+     enc_pm25 = TCNEncoder(in_channels=1)
+     enc_met = TCNEncoder(in_channels=7)
+diff -ruN '--exclude=docs' orig_tree/src/models/variants.py /mnt/user-data/outputs/c_plus/src/models/variants.py
+--- orig_tree/src/models/variants.py	2026-10-06 21:39:25.913104206 +0800
++++ /mnt/user-data/outputs/c_plus/src/models/variants.py	2026-10-06 21:39:25.763453855 +0800
+@@ -16,8 +16,8 @@
+ import torch
+ import torch.nn as nn
+ 
+-from src.models.tcn import TCNEncoder
+-from src.models.attention import CrossModalAttentionFusion
++from src.models.tcn import TCNEncoder, MultiScaleTCNEncoder
++from src.models.attention import CrossModalAttentionFusion, CrossModalAttentionFusionPlus
+ 
+ 
+ class ForecastHead(nn.Module):
+@@ -102,6 +102,119 @@
+         return self.head(h)
+ 
+ 
++# ---------------------------------------------------------------------------
++# C+ (improved AIRPRED). VariantC_AIRPRED above is NOT modified, so the original
++# model and its checkpoints stay reproducible. See docs/variant_c_plus.md.
++# ---------------------------------------------------------------------------
++
++C_PLUS_DEFAULTS = dict(
++    tcn_channels=[64, 64, 128, 128], dilations=[1, 2, 4, 8], kernel_size=3, tcn_block_dropout=0.0,
++    d_model=128, num_attention_heads=4, ffn_dim=256, fused_dim=256,
++    multi_scale=True, ms_taps=None,
++    input_norm=True, attention_dropout=0.1, ffn_dropout=0.1, bidirectional_attention=False,
++)
++
++# Ablation presets. A preset pins ONLY the keys it lists; every other value comes from
++# config.yaml (model.c_plus) -- so CPLUS is "whatever the config says".
++C_PLUS_PRESETS = {
++    "CMS":     dict(multi_scale=True, input_norm=False, attention_dropout=0.0, ffn_dropout=0.0,
++                    bidirectional_attention=False),                      # C + multi-scale TCN only
++    "CATT":    dict(multi_scale=False, bidirectional_attention=False),   # C + improved attention only
++    "CPLUS":   dict(),                                                   # multi-scale + improved attention
++    "CPLUSBI": dict(bidirectional_attention=True),                       # CPLUS + bidirectional attention
++}
++
++VARIANT_KEYS = ["A", "B", "C", "D"] + list(C_PLUS_PRESETS)
++
++
++class VariantC_Plus(nn.Module):
++    """Improved AIRPRED (CMA-TCN+). Same interface as VariantC_AIRPRED:
++    forward(x_pm25, x_met, return_attention=False) -> (B, horizon).
++
++    Two separate modality branches (PM2.5 / meteorology) -> optional multi-scale TCN
++    readout -> cross-modal attention (PM2.5 = Query, meteorology = Key/Value; optional
++    reverse direction) -> same ForecastHead as every other variant."""
++
++    def __init__(self, n_met_features: int = 7, horizon: int = 24, **kw):
++        super().__init__()
++        unknown = set(kw) - set(C_PLUS_DEFAULTS)
++        assert not unknown, f"unknown C+ options: {sorted(unknown)}"
++        c = {**C_PLUS_DEFAULTS, **kw}
++        self.hparams = c
++        d = c["d_model"]
++
++        def enc(in_ch):
++            return MultiScaleTCNEncoder(
++                in_ch, channels=c["tcn_channels"], dilations=c["dilations"], kernel_size=c["kernel_size"],
++                block_dropout=c["tcn_block_dropout"], multi_scale=c["multi_scale"], taps=c["ms_taps"], out_dim=d)
++
++        self.pm25_encoder = enc(1)
++        self.met_encoder = enc(n_met_features)
++        assert self.pm25_encoder.out_channels == d, (
++            f"branch output ({self.pm25_encoder.out_channels}) must equal d_model ({d}): "
++            f"use multi_scale=true, or set tcn_channels[-1] = d_model")
++        self.fusion = CrossModalAttentionFusionPlus(
++            d_model=d, num_heads=c["num_attention_heads"], ffn_dim=c["ffn_dim"], fused_dim=c["fused_dim"],
++            attention_dropout=c["attention_dropout"], ffn_dropout=c["ffn_dropout"],
++            input_norm=c["input_norm"], bidirectional=c["bidirectional_attention"])
++        self.head = ForecastHead(in_dim=c["fused_dim"], horizon=horizon)
++
++    def forward(self, x_pm25: torch.Tensor, x_met: torch.Tensor, return_attention: bool = False):
++        h_pm25 = self.pm25_encoder(x_pm25)
++        h_met = self.met_encoder(x_met)
++        fused, attn = self.fusion(h_pm25, h_met, need_weights=return_attention)
++        out = self.head(fused)
++        return (out, attn) if return_attention else out
++
++
++class ResidualForecast(nn.Module):
++    """Optional residual forecasting: out = last observed (scaled) PM2.5 + base(x).
++    The head's output layer is zero-initialised so training starts at persistence.
++    state_dict()/load_state_dict() delegate to the base model, so checkpoints keep the
++    ordinary format (residual-ness is code, not weights -- record it in the file name)."""
++
++    def __init__(self, base: nn.Module, zero_init: bool = True):
++        super().__init__()
++        self.base = base
++        if zero_init:
++            nn.init.zeros_(base.head.fc2.weight)
++            nn.init.zeros_(base.head.fc2.bias)
++
++    def forward(self, x_pm25, x_met=None, **kw):
++        out = self.base(x_pm25, x_met, **kw)
++        if isinstance(out, tuple):
++            return (out[0] + x_pm25[:, -1, :],) + tuple(out[1:])
++        return out + x_pm25[:, -1, :]
++
++    def state_dict(self, *a, **k):
++        return self.base.state_dict(*a, **k)
++
++    def load_state_dict(self, sd, *a, **k):
++        return self.base.load_state_dict(sd, *a, **k)
++
++
++def build_variant(name: str, horizon: int, cfg: dict, residual: bool = False, overrides: dict | None = None):
++    """Single place that turns a variant key (A, B, C, D, CMS, CATT, CPLUS, CPLUSBI) into a model.
++    A, B, D and the original C are constructed exactly as before. `overrides` (e.g.
++    {"attention_dropout": 0.2}) are applied to the config values BEFORE the preset's pins."""
++    name = name.upper()
++    mcfg = cfg["model"]
++    if name == "A":
++        model = VariantA_SingleBranchUnified(horizon=horizon)
++    elif name == "B":
++        model = VariantB_DualBranchConcat(horizon=horizon)
++    elif name == "D":
++        model = VariantD_PM25Only(horizon=horizon)
++    elif name == "C":
++        model = VariantC_AIRPRED(horizon=horizon, d_model=mcfg["d_model"], num_heads=mcfg["num_attention_heads"])
++    elif name in C_PLUS_PRESETS:
++        opts = {**C_PLUS_DEFAULTS, **(mcfg.get("c_plus") or {}), **(overrides or {}), **C_PLUS_PRESETS[name]}
++        model = VariantC_Plus(horizon=horizon, **opts)
++    else:
++        raise ValueError(f"unknown variant {name!r}; choose from {VARIANT_KEYS}")
++    return ResidualForecast(model) if residual else model
++
++
+ if __name__ == "__main__":
+     B, L, H = 4, 48, 24
+     x_pm25, x_met = torch.randn(B, L, 1), torch.randn(B, L, 7)
+diff -ruN '--exclude=docs' orig_tree/src/training/train.py /mnt/user-data/outputs/c_plus/src/training/train.py
+--- orig_tree/src/training/train.py	2026-10-06 21:39:25.915074442 +0800
++++ /mnt/user-data/outputs/c_plus/src/training/train.py	2026-10-06 21:39:25.813829601 +0800
+@@ -38,7 +38,11 @@
+     by the time this function receives the model object."""
+     device = cfg["training"]["device"]
+     model.to(device)
+-    opt = torch.optim.Adam(model.parameters(), lr=cfg["training"]["learning_rate"])
++    opt = torch.optim.Adam(
++        model.parameters(),
++        lr=cfg["training"]["learning_rate"],
++        weight_decay=cfg["training"].get("weight_decay", 0.0),   # 0.0 -> identical to the previous Adam
++    )
+     loss_fn = torch.nn.MSELoss()
+ 
+     train_loader = make_loader(*train_data, cfg["training"]["batch_size"], shuffle=True)
+diff -ruN '--exclude=docs' orig_tree/train_local.py /mnt/user-data/outputs/c_plus/train_local.py
+--- orig_tree/train_local.py	2026-10-06 21:39:25.920777648 +0800
++++ /mnt/user-data/outputs/c_plus/train_local.py	2026-10-06 21:39:25.859045801 +0800
+@@ -13,6 +13,16 @@
+     python train_local.py --variants D --seeds 42   # run just one variant, one seed
+                                                       # (e.g. a quick diagnostic re-run)
+ 
++C+ (improved AIRPRED) and ablations -- see docs/variant_c_plus.md:
++    python train_local.py --variants CPLUS --seeds 42             # improved C+
++    python train_local.py --variants C CMS CATT CPLUS CPLUSBI --seeds 42 123 7
++    python train_local.py --variants C --residual --seeds 42      # C + residual forecasting
++    python train_local.py --variants CPLUS --lr 3e-4 --weight-decay 1e-5 --attn-dropout 0.2 --tag _lr3e-4_wd1e-5_ad0.2
++  Every run that changes lr / weight decay / dropout / residual MUST get its own --tag
++  (a residual run gets "_resid" automatically); the tag goes into the checkpoint, results
++  CSV and run-config JSON names so nothing overwrites the baseline files. Selection is by
++  validation RMSE only -- this script never reads the test split.
++
+ PREREQUISITES:
+   1. Stage 1 must have already run (in Colab, as before) and produced
+      train.npz, val.npz, test.npz, scaler.pkl.
+@@ -30,12 +40,9 @@
+ import numpy as np
+ import torch
+ 
+-from src.models.variants import (
+-    VariantA_SingleBranchUnified,
+-    VariantB_DualBranchConcat,
+-    VariantC_AIRPRED,
+-    VariantD_PM25Only,
+-)
++import json
++
++from src.models.variants import VARIANT_KEYS, build_variant
+ from src.training.train import train_variant, set_seed
+ 
+ DATA_DIR = "data/final"
+@@ -44,12 +51,7 @@
+ 
+ DEFAULT_SEEDS = [42, 123, 2024, 7, 99]
+ 
+-VARIANTS = {
+-    "A": VariantA_SingleBranchUnified,
+-    "B": VariantB_DualBranchConcat,
+-    "C": VariantC_AIRPRED,
+-    "D": VariantD_PM25Only,
+-}
++DEFAULT_VARIANTS = ["A", "B", "C", "D"]   # default run unchanged; C+ keys are opt-in via --variants
+ 
+ 
+ def load_split(name: str):
+@@ -57,16 +59,6 @@
+     return d["X_pm25"], d["X_met"], d["Y"], d["cities"]
+ 
+ 
+-def build_model(name: str, ModelClass, horizon: int, cfg: dict):
+-    if name != "C":
+-        return ModelClass(horizon=horizon)
+-    return ModelClass(
+-        horizon=horizon,
+-        d_model=cfg["model"]["d_model"],
+-        num_heads=cfg["model"]["num_attention_heads"],
+-    )
+-
+-
+ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument(
+@@ -79,15 +71,35 @@
+              "variant's best-seed checkpoint.",
+     )
+     parser.add_argument(
+-        "--variants", type=str, nargs="+", default=list(VARIANTS.keys()),
+-        choices=list(VARIANTS.keys()),
+-        help=f"Which variants to run (default: all {list(VARIANTS.keys())}). "
+-             f"E.g. --variants D for a quick single-variant diagnostic run.",
++        "--variants", type=str, nargs="+", default=DEFAULT_VARIANTS,
++        choices=VARIANT_KEYS,
++        help=f"Which variants to run (default: {DEFAULT_VARIANTS}). C+ ablation keys: "
++             f"CMS (C + multi-scale TCN), CATT (C + improved attention), CPLUS (both), "
++             f"CPLUSBI (CPLUS + bidirectional attention).",
+     )
++    parser.add_argument("--lr", type=float, default=None, help="override training.learning_rate")
++    parser.add_argument("--weight-decay", type=float, default=None, help="override training.weight_decay (Adam L2)")
++    parser.add_argument("--max-epochs", type=int, default=None, help="override training.max_epochs")
++    parser.add_argument("--patience", type=int, default=None, help="override training.early_stopping_patience")
++    parser.add_argument("--attn-dropout", type=float, default=None,
++                        help="override model.c_plus.attention_dropout (C+ variants that use dropout; "
++                             "CMS pins it to 0 on purpose, original C has none)")
++    parser.add_argument("--residual", action="store_true",
++                        help="residual forecasting: out = last observed PM2.5 + model(x). Adds _resid to names.")
++    parser.add_argument("--tag", default="", help="suffix for checkpoint/CSV/JSON names, e.g. _lr3e-4")
+     args = parser.parse_args()
+-    variants_to_run = {name: VARIANTS[name] for name in args.variants}
++    tag = ("_resid" if args.residual else "") + args.tag
++    variants_to_run = list(args.variants)
+ 
+     cfg = yaml.safe_load(open("configs/config.yaml"))
++    if args.lr is not None: cfg["training"]["learning_rate"] = args.lr
++    if args.weight_decay is not None: cfg["training"]["weight_decay"] = args.weight_decay
++    if args.max_epochs is not None: cfg["training"]["max_epochs"] = args.max_epochs
++    if args.patience is not None: cfg["training"]["early_stopping_patience"] = args.patience
++    overrides = {"attention_dropout": args.attn_dropout} if args.attn_dropout is not None else None
++    # C+ keys without an explicit tag still get their own CSV, so the baseline results file is never overwritten.
++    csv_tag = tag or ("_cplus" if any(v not in DEFAULT_VARIANTS for v in variants_to_run) else "")
++    results_csv = RESULTS_CSV.replace(".csv", f"{csv_tag}.csv")
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+     cfg["training"]["device"] = device
+     print(f"Using device: {device}")
+@@ -108,29 +120,40 @@
+     horizon = cfg["data"]["forecast_horizon"]
+     os.makedirs(CKPT_DIR, exist_ok=True)
+     os.makedirs(os.path.dirname(RESULTS_CSV), exist_ok=True)
++    if tag:
++        print(f"Run tag: '{tag}'  (baseline files are not touched)")
+ 
+     print(f"Seeds this run: {args.seeds}\n")
+ 
+     # (variant, seed) -> best_val_rmse
+     all_results: dict[tuple[str, int], float] = {}
++    param_counts: dict[str, int] = {}
+ 
+     for seed in args.seeds:
+-        for name, ModelClass in variants_to_run.items():
++        for name in variants_to_run:
+             print(f"\n{'='*60}\nTraining Variant {name} -- seed {seed}\n{'='*60}")
+             set_seed(seed)  # same placement as the earlier fix: before model construction
+-            model = build_model(name, ModelClass, horizon, cfg)
+-            ckpt_path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}_best.pt"
++            model = build_variant(name, horizon, cfg, residual=args.residual, overrides=overrides)
++            n_params = sum(p.numel() for p in model.parameters())
++            param_counts[name] = n_params
++            print(f"  parameters: {n_params:,}")
++            ckpt_path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}{tag}_best.pt"
+             best_rmse = train_variant(model, train_data, val_data, cfg, ckpt_path)
+             all_results[(name, seed)] = best_rmse
+             print(f"Variant {name}, seed {seed} -- best val RMSE (scaled): {best_rmse:.4f}")
+ 
+     # Every (variant, seed) result goes to CSV so nothing has to be re-derived from logs later.
+-    with open(RESULTS_CSV, "w", newline="") as f:
++    with open(results_csv, "w", newline="") as f:
+         writer = csv.writer(f)
+         writer.writerow(["variant", "seed", "best_val_rmse"])
+         for (name, seed), rmse in all_results.items():
+             writer.writerow([name, seed, f"{rmse:.6f}"])
+-    print(f"\nPer-(variant, seed) results written to {RESULTS_CSV}")
++    print(f"\nPer-(variant, seed) results written to {results_csv}")
++    # Sidecar: everything needed to say later exactly what produced these numbers.
++    with open(results_csv.replace(".csv", "_config.json"), "w") as f:
++        json.dump({"variants": variants_to_run, "seeds": args.seeds, "residual": args.residual, "tag": tag,
++                   "training": cfg["training"], "model": cfg["model"], "attention_dropout_override": args.attn_dropout,
++                   "parameters": param_counts}, f, indent=2, default=str)
+ 
+     # Aggregate: mean +/- std per variant across seeds.
+     print(f"\n{'='*60}\nAggregate across {len(args.seeds)} seeds\n{'='*60}")
+@@ -150,7 +173,7 @@
+             for seed in args.seeds:
+                 if seed == best_seed:
+                     continue
+-                path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}_best.pt"
++                path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}{tag}_best.pt"
+                 if os.path.exists(path):
+                     os.remove(path)
+         print("\nKept only each variant's best-seed checkpoint (pass --keep-checkpoints to keep all).")

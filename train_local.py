@@ -13,6 +13,16 @@ USAGE:
     python train_local.py --variants D --seeds 42   # run just one variant, one seed
                                                       # (e.g. a quick diagnostic re-run)
 
+C+ (improved AIRPRED) and ablations -- see docs/variant_c_plus.md:
+    python train_local.py --variants CPLUS --seeds 42             # improved C+
+    python train_local.py --variants C CMS CATT CPLUS CPLUSBI --seeds 42 123 7
+    python train_local.py --variants C --residual --seeds 42      # C + residual forecasting
+    python train_local.py --variants CPLUS --lr 3e-4 --weight-decay 1e-5 --attn-dropout 0.2 --tag _lr3e-4_wd1e-5_ad0.2
+  Every run that changes lr / weight decay / dropout / residual MUST get its own --tag
+  (a residual run gets "_resid" automatically); the tag goes into the checkpoint, results
+  CSV and run-config JSON names so nothing overwrites the baseline files. Selection is by
+  validation RMSE only -- this script never reads the test split.
+
 PREREQUISITES:
   1. Stage 1 must have already run (in Colab, as before) and produced
      train.npz, val.npz, test.npz, scaler.pkl.
@@ -30,12 +40,9 @@ import yaml
 import numpy as np
 import torch
 
-from src.models.variants import (
-    VariantA_SingleBranchUnified,
-    VariantB_DualBranchConcat,
-    VariantC_AIRPRED,
-    VariantD_PM25Only,
-)
+import json
+
+from src.models.variants import VARIANT_KEYS, build_variant
 from src.training.train import train_variant, set_seed
 
 DATA_DIR = "data/final"
@@ -44,27 +51,12 @@ RESULTS_CSV = "results/multiseed_val_rmse.csv"
 
 DEFAULT_SEEDS = [42, 123, 2024, 7, 99]
 
-VARIANTS = {
-    "A": VariantA_SingleBranchUnified,
-    "B": VariantB_DualBranchConcat,
-    "C": VariantC_AIRPRED,
-    "D": VariantD_PM25Only,
-}
+DEFAULT_VARIANTS = ["A", "B", "C", "D"]   # default run unchanged; C+ keys are opt-in via --variants
 
 
 def load_split(name: str):
     d = np.load(f"{DATA_DIR}/{name}.npz", allow_pickle=True)
     return d["X_pm25"], d["X_met"], d["Y"], d["cities"]
-
-
-def build_model(name: str, ModelClass, horizon: int, cfg: dict):
-    if name != "C":
-        return ModelClass(horizon=horizon)
-    return ModelClass(
-        horizon=horizon,
-        d_model=cfg["model"]["d_model"],
-        num_heads=cfg["model"]["num_attention_heads"],
-    )
 
 
 def main():
@@ -79,15 +71,35 @@ def main():
              "variant's best-seed checkpoint.",
     )
     parser.add_argument(
-        "--variants", type=str, nargs="+", default=list(VARIANTS.keys()),
-        choices=list(VARIANTS.keys()),
-        help=f"Which variants to run (default: all {list(VARIANTS.keys())}). "
-             f"E.g. --variants D for a quick single-variant diagnostic run.",
+        "--variants", type=str, nargs="+", default=DEFAULT_VARIANTS,
+        choices=VARIANT_KEYS,
+        help=f"Which variants to run (default: {DEFAULT_VARIANTS}). C+ ablation keys: "
+             f"CMS (C + multi-scale TCN), CATT (C + improved attention), CPLUS (both), "
+             f"CPLUSBI (CPLUS + bidirectional attention).",
     )
+    parser.add_argument("--lr", type=float, default=None, help="override training.learning_rate")
+    parser.add_argument("--weight-decay", type=float, default=None, help="override training.weight_decay (Adam L2)")
+    parser.add_argument("--max-epochs", type=int, default=None, help="override training.max_epochs")
+    parser.add_argument("--patience", type=int, default=None, help="override training.early_stopping_patience")
+    parser.add_argument("--attn-dropout", type=float, default=None,
+                        help="override model.c_plus.attention_dropout (C+ variants that use dropout; "
+                             "CMS pins it to 0 on purpose, original C has none)")
+    parser.add_argument("--residual", action="store_true",
+                        help="residual forecasting: out = last observed PM2.5 + model(x). Adds _resid to names.")
+    parser.add_argument("--tag", default="", help="suffix for checkpoint/CSV/JSON names, e.g. _lr3e-4")
     args = parser.parse_args()
-    variants_to_run = {name: VARIANTS[name] for name in args.variants}
+    tag = ("_resid" if args.residual else "") + args.tag
+    variants_to_run = list(args.variants)
 
     cfg = yaml.safe_load(open("configs/config.yaml"))
+    if args.lr is not None: cfg["training"]["learning_rate"] = args.lr
+    if args.weight_decay is not None: cfg["training"]["weight_decay"] = args.weight_decay
+    if args.max_epochs is not None: cfg["training"]["max_epochs"] = args.max_epochs
+    if args.patience is not None: cfg["training"]["early_stopping_patience"] = args.patience
+    overrides = {"attention_dropout": args.attn_dropout} if args.attn_dropout is not None else None
+    # C+ keys without an explicit tag still get their own CSV, so the baseline results file is never overwritten.
+    csv_tag = tag or ("_cplus" if any(v not in DEFAULT_VARIANTS for v in variants_to_run) else "")
+    results_csv = RESULTS_CSV.replace(".csv", f"{csv_tag}.csv")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg["training"]["device"] = device
     print(f"Using device: {device}")
@@ -108,29 +120,40 @@ def main():
     horizon = cfg["data"]["forecast_horizon"]
     os.makedirs(CKPT_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(RESULTS_CSV), exist_ok=True)
+    if tag:
+        print(f"Run tag: '{tag}'  (baseline files are not touched)")
 
     print(f"Seeds this run: {args.seeds}\n")
 
     # (variant, seed) -> best_val_rmse
     all_results: dict[tuple[str, int], float] = {}
+    param_counts: dict[str, int] = {}
 
     for seed in args.seeds:
-        for name, ModelClass in variants_to_run.items():
+        for name in variants_to_run:
             print(f"\n{'='*60}\nTraining Variant {name} -- seed {seed}\n{'='*60}")
             set_seed(seed)  # same placement as the earlier fix: before model construction
-            model = build_model(name, ModelClass, horizon, cfg)
-            ckpt_path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}_best.pt"
+            model = build_variant(name, horizon, cfg, residual=args.residual, overrides=overrides)
+            n_params = sum(p.numel() for p in model.parameters())
+            param_counts[name] = n_params
+            print(f"  parameters: {n_params:,}")
+            ckpt_path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}{tag}_best.pt"
             best_rmse = train_variant(model, train_data, val_data, cfg, ckpt_path)
             all_results[(name, seed)] = best_rmse
             print(f"Variant {name}, seed {seed} -- best val RMSE (scaled): {best_rmse:.4f}")
 
     # Every (variant, seed) result goes to CSV so nothing has to be re-derived from logs later.
-    with open(RESULTS_CSV, "w", newline="") as f:
+    with open(results_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["variant", "seed", "best_val_rmse"])
         for (name, seed), rmse in all_results.items():
             writer.writerow([name, seed, f"{rmse:.6f}"])
-    print(f"\nPer-(variant, seed) results written to {RESULTS_CSV}")
+    print(f"\nPer-(variant, seed) results written to {results_csv}")
+    # Sidecar: everything needed to say later exactly what produced these numbers.
+    with open(results_csv.replace(".csv", "_config.json"), "w") as f:
+        json.dump({"variants": variants_to_run, "seeds": args.seeds, "residual": args.residual, "tag": tag,
+                   "training": cfg["training"], "model": cfg["model"], "attention_dropout_override": args.attn_dropout,
+                   "parameters": param_counts}, f, indent=2, default=str)
 
     # Aggregate: mean +/- std per variant across seeds.
     print(f"\n{'='*60}\nAggregate across {len(args.seeds)} seeds\n{'='*60}")
@@ -150,7 +173,7 @@ def main():
             for seed in args.seeds:
                 if seed == best_seed:
                     continue
-                path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}_best.pt"
+                path = f"{CKPT_DIR}/variant_{name.lower()}_seed{seed}{tag}_best.pt"
                 if os.path.exists(path):
                     os.remove(path)
         print("\nKept only each variant's best-seed checkpoint (pass --keep-checkpoints to keep all).")

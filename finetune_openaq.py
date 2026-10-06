@@ -70,12 +70,7 @@ import yaml
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.evaluation.evaluate import compute_metrics, evaluate_model, inverse_scale_pm25
-from src.models.variants import (
-    VariantA_SingleBranchUnified,
-    VariantB_DualBranchConcat,
-    VariantC_AIRPRED,
-    VariantD_PM25Only,
-)
+from src.models.variants import VARIANT_KEYS, build_variant
 from src.preprocessing.preprocessing import (
     FEATURE_COLS,
     build_dataset,
@@ -84,12 +79,8 @@ from src.preprocessing.preprocessing import (
 )
 from src.training.train import set_seed
 
-VARIANTS = {
-    "A": VariantA_SingleBranchUnified,
-    "B": VariantB_DualBranchConcat,
-    "C": VariantC_AIRPRED,
-    "D": VariantD_PM25Only,
-}
+VARIANTS = VARIANT_KEYS                       # A-D as before, plus the C+ ablation keys (CMS, CATT, CPLUS, CPLUSBI)
+DEFAULT_VARIANTS = ["A", "B", "C", "D"]
 
 
 class ResidualWrapper(nn.Module):
@@ -104,13 +95,7 @@ class ResidualWrapper(nn.Module):
 
 
 def build_model(name: str, horizon: int, cfg: dict):
-    if name != "C":
-        return VARIANTS[name](horizon=horizon)
-    return VARIANTS[name](
-        horizon=horizon,
-        d_model=cfg["model"]["d_model"],
-        num_heads=cfg["model"]["num_attention_heads"],
-    )
+    return build_variant(name, horizon, cfg)
 
 
 def load_city_frames(data_dir: str, cities: list[str] | None) -> pd.DataFrame:
@@ -215,7 +200,7 @@ def main():
     ap.add_argument("--ckpt-dir", default="checkpoints")
     ap.add_argument("--seed", type=int, default=42, help="which ORIGINAL checkpoint seed to start from (default 42, what main.py serves)")
     ap.add_argument("--seeds", type=int, nargs="+", default=[42], help="fine-tuning seeds (shuffling/dropout); several -> mean +/- std")
-    ap.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS))
+    ap.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS, choices=VARIANTS)
     ap.add_argument("--cities", nargs="+", default=None)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--epochs", type=int, default=30)
@@ -293,7 +278,9 @@ def main():
             set_seed(fs)
             net = copy.deepcopy(base)
             if args.attn_dropout > 0 and hasattr(net, "fusion"):
-                net.fusion.mha.dropout = args.attn_dropout       # nn.MultiheadAttention reads .dropout in train mode
+                for m in net.fusion.modules():                   # C has one MHA; CPLUSBI has two
+                    if isinstance(m, nn.MultiheadAttention):
+                        m.dropout = args.attn_dropout            # nn.MultiheadAttention reads .dropout in train mode
             if args.freeze_encoders:
                 for pname, p in net.named_parameters():
                     if "encoder" in pname:
