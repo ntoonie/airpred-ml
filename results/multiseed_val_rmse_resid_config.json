@@ -1,0 +1,78 @@
+{
+  "variants": [
+    "CPLUS"
+  ],
+  "seeds": [
+    42,
+    123,
+    2024,
+    7,
+    99
+  ],
+  "residual": true,
+  "tag": "_resid",
+  "training": {
+    "optimizer": "adam",
+    "learning_rate": 0.001,
+    "batch_size": 64,
+    "max_epochs": 100,
+    "early_stopping_patience": 10,
+    "early_stopping_metric": "val_rmse",
+    "loss": "mse",
+    "weight_decay": 0.0,
+    "random_seed": 42,
+    "device": "cuda"
+  },
+  "model": {
+    "tcn_blocks": 4,
+    "dilations": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "tcn_channels": [
+      64,
+      64,
+      128,
+      128
+    ],
+    "kernel_size": 3,
+    "d_model": 128,
+    "num_attention_heads": 4,
+    "fused_dim": 256,
+    "forecast_head_hidden": 128,
+    "forecast_head_dropout": 0.1,
+    "tcn_block_dropout": 0.0,
+    "c_plus": {
+      "tcn_channels": [
+        64,
+        64,
+        128,
+        128
+      ],
+      "dilations": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "kernel_size": 3,
+      "tcn_block_dropout": 0.0,
+      "d_model": 128,
+      "num_attention_heads": 4,
+      "ffn_dim": 256,
+      "fused_dim": 256,
+      "multi_scale": true,
+      "ms_taps": null,
+      "input_norm": true,
+      "attention_dropout": 0.1,
+      "ffn_dropout": 0.1,
+      "bidirectional_attention": false
+    }
+  },
+  "attention_dropout_override": null,
+  "parameters": {
+    "CPLUS": 666520
+  }
+}
