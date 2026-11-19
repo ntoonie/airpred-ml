@@ -1,0 +1,13 @@
+﻿Seeds found: [123, 42, 99]
+
+Table 12 (mean +/- sample SD across seeds)
+Variant C: RMSE 6.0227 +/- 0.1340 | MAE 3.9069 +/- 0.0992 | MAPE 32.6574 +/- 1.1165 | R2 0.2510 +/- 0.0333
+Variant A: RMSE 6.2647 +/- 0.0511 | MAE 4.0916 +/- 0.0664 | MAPE 33.4657 +/- 0.6021 | R2 0.1899 +/- 0.0132
+Variant B: RMSE 6.1578 +/- 0.0479 | MAE 3.9762 +/- 0.0578 | MAPE 33.0093 +/- 0.8271 | R2 0.2173 +/- 0.0122
+Variant D: RMSE 6.2374 +/- 0.0188 | MAE 4.1380 +/- 0.1242 | MAPE 35.3515 +/- 3.0216 | R2 0.1969 +/- 0.0048
+
+Table 13 (paired t-test on per-window RMSE, per seed)
+H1 (C vs A): t per seed = -17.8565, -38.1482, -24.2623 | max p = 0
+RQ1 (B vs A): t per seed = -21.1072, -14.0925, -15.0609 | max p = 0
+RQ2 (C vs B): t per seed = 2.6464, -29.1481, -10.6535 | max p = 0.008138
+RQ3 (C vs D): t per seed = -28.6748, -40.4747, 2.6076 | max p = 0.009121
